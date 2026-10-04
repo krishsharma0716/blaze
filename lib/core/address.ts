@@ -14,6 +14,7 @@ export type AddressBrief = {
 };
 
 const BOROUGHS = new Set(["Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"]);
+const NYC_PLACES = /^(manhattan|bronx|brooklyn|queens|staten island|new york|new york city|nyc|ny)$/i;
 
 type GeoFeature = {
   geometry?: { coordinates?: [number, number] };
@@ -29,7 +30,7 @@ function hazards(year: number, buildingClass: string): string[] {
   const lines: string[] = [];
   if (year > 0 && year < 1940) lines.push("Balloon framing and voids, knob-and-tube wiring, lead paint");
   if (year >= 1930 && year <= 1980) lines.push("Possible asbestos");
-  if (year > 0 && year < 1978) lines.push("Lead paint");
+  if (year >= 1940 && year < 1978) lines.push("Lead paint");
   if (year >= 1965 && year <= 1973) lines.push("Possible aluminum branch wiring");
   if (year >= 1990) lines.push("Lightweight trusses and I-joists, early collapse");
   if (/^[ABC]/i.test(buildingClass)) lines.push("Shared cocklofts and party walls");
@@ -71,12 +72,24 @@ async function solarPermitOnFile(bbl: string): Promise<Tag> {
 export async function getAddressBrief(address: string): Promise<AddressBrief | { error: string }> {
   const query = address.trim();
   if (!query) return { error: "This brief covers New York City only." };
+  try {
   const geo = await fetch(
     `https://geosearch.planninglabs.nyc/v2/search?text=${encodeURIComponent(query)}&size=1`,
     { signal: AbortSignal.timeout(8000) },
   );
   if (!geo.ok) return { error: "Address lookup unavailable." };
-  const found = (await geo.json()) as { features?: GeoFeature[] };
+  const found = (await geo.json()) as {
+    features?: GeoFeature[];
+    geocoding?: { query?: { parsed_text?: { locality?: string; admin?: string; region?: string } } };
+  };
+  const namedPlace = [
+    found.geocoding?.query?.parsed_text?.locality,
+    found.geocoding?.query?.parsed_text?.admin,
+    found.geocoding?.query?.parsed_text?.region,
+  ].filter((place): place is string => Boolean(place));
+  if (namedPlace.some((place) => !NYC_PLACES.test(place.trim()))) {
+    return { error: "This brief covers New York City only." };
+  }
   const feature = found.features?.[0];
   const borough = feature?.properties?.borough ?? "";
   const bbl = feature?.properties?.addendum?.pad?.bbl ?? "";
@@ -87,7 +100,7 @@ export async function getAddressBrief(address: string): Promise<AddressBrief | {
 
   const pluto = await fetch(
     `https://data.cityofnewyork.us/resource/64uk-42ks.json?$select=yearbuilt,bldgclass,numfloors,yearalter1&$where=bbl=${Number(bbl)}&$limit=1`,
-    { signal: AbortSignal.timeout(8000) },
+    { signal: AbortSignal.timeout(20000) },
   );
   if (!pluto.ok) return { error: "Building record unavailable." };
   const lots = (await pluto.json()) as {
@@ -145,4 +158,7 @@ export async function getAddressBrief(address: string): Promise<AddressBrief | {
   ].join(" ");
 
   return { title, lat: coords[1], lon: coords[0], tags, summary };
+  } catch {
+    return { error: "Address lookup unavailable." };
+  }
 }

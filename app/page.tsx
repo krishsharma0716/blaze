@@ -7,6 +7,7 @@
  */
 import { useEffect, useState } from "react";
 import { speakBrief } from "../lib/core/speakBrief";
+import { DbConnection } from "../lib/module_bindings";
 import { SPACETIME_DB, SPACETIME_HOST, type IncidentRow } from "../lib/spacetime";
 
 const PHASE_0_TAGS = [
@@ -24,27 +25,38 @@ export default function HomePage() {
 
   useEffect(() => {
     let cancelled = false;
-    let connection: { disconnect?: () => void } | undefined;
-
-    async function connect() {
-      try {
-        const bindings = await import("../lib/module_bindings");
-        if (cancelled) return;
-        connection = bindings.subscribeIncidents(SPACETIME_HOST, SPACETIME_DB, (rows) => {
-          if (!cancelled) setIncidents(rows);
+    const readRows = (conn: DbConnection) => {
+      const rows: IncidentRow[] = [];
+      for (const row of conn.db.incident.iter()) {
+        rows.push({
+          id: row.id,
+          kind: row.kind,
+          title: row.title,
+          lat: row.lat,
+          lon: row.lon,
+          source: row.source,
         });
-        if (!cancelled) setStatus(`Live on ${SPACETIME_DB}`);
-      } catch {
-        if (!cancelled) {
-          setStatus("Bindings are not generated yet. Publish the module, then run spacetime generate.");
-        }
       }
-    }
+      if (!cancelled) setIncidents(rows);
+    };
 
-    void connect();
+    const connection = DbConnection.builder()
+      .withUri(SPACETIME_HOST)
+      .withDatabaseName(SPACETIME_DB)
+      .onConnect((conn) => {
+        if (!cancelled) setStatus(`Live on ${SPACETIME_DB}`);
+        const refresh = () => readRows(conn);
+        conn.db.incident.onInsert(refresh);
+        conn.subscriptionBuilder().onApplied(refresh).subscribe("SELECT * FROM incident");
+      })
+      .onConnectError((_ctx, error) => {
+        if (!cancelled) setStatus(`SpacetimeDB unavailable: ${error.message}`);
+      })
+      .build();
+
     return () => {
       cancelled = true;
-      connection?.disconnect?.();
+      connection.disconnect();
     };
   }, []);
 

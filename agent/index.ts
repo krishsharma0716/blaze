@@ -4,11 +4,15 @@
  * Leave this terminal open during judging. It is not a Next.js route.
  */
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { Spectrum } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 
 const execFileAsync = promisify(execFile);
+const localCli = `${homedir()}/.local/bin/spacetime`;
+const spacetime = existsSync(localCli) ? localCli : "spacetime";
 
 const projectId = process.env.SPECTRUM_PROJECT_ID;
 const projectSecret = process.env.SPECTRUM_PROJECT_SECRET;
@@ -20,7 +24,7 @@ if (!projectId || !projectSecret) {
 }
 
 async function recordText(sender: string, text: string) {
-  await execFileAsync("spacetime", [
+  await execFileAsync(spacetime, [
     "call",
     "-s",
     "maincloud",

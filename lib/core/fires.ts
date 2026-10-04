@@ -1,9 +1,10 @@
 /**
- * Loads current US fire perimeters, plus the Palisades history feature.
+ * Loads active US wildfire perimeters (not fully contained), plus the Palisades history feature.
  * Connected to app/api/fires/route.ts and the NIFC WFIGS FeatureServers.
- * Called when the map opens or when Palisades is selected, not from a file.
+ * Called when the map opens or when Palisades is selected. DEMO_MODE=1 serves fixtures/demo/palisades.json.
  */
-import { centroidOf, ringOf, simplifyRing, type FireGeometry, type LngLat } from "./geo";
+import { demoPalisades } from "./demo";
+import { areaHa, centroidOf, partsOf, ringOf, simplifyRing, type FireGeometry, type LngLat } from "./geo";
 
 export type FirePolygon = FireGeometry;
 
@@ -12,6 +13,7 @@ export type FireRecord = {
   name: string;
   acres: number | null;
   containment: number | null;
+  state: string | null;
   centroid: LngLat;
   geometry: FireGeometry;
 };
@@ -33,16 +35,22 @@ function num(value: unknown): number | null {
 
 function toRecord(feature: WfigsFeature, id: string): FireRecord | null {
   if (!feature.geometry) return null;
-  const ring = simplifyRing(ringOf(feature.geometry));
-  if (ring.length < 3) return null;
+  const largest = ringOf(feature.geometry);
+  if (largest.length < 3) return null;
+  const parts = partsOf(feature.geometry)
+    .map((part) => ({ part, area: areaHa(part) }))
+    .sort((a, b) => b.area - a.area)
+    .slice(0, 8)
+    .map(({ part }) => [simplifyRing(part, 60)]);
   const props = feature.properties ?? {};
   return {
     id,
     name: String(props.poly_IncidentName ?? "Unnamed fire"),
     acres: num(props.poly_GISAcres),
     containment: num(props.attr_PercentContained),
-    centroid: centroidOf(ring),
-    geometry: { type: "Polygon", coordinates: [ring] },
+    state: typeof props.attr_POOState === "string" ? props.attr_POOState.replace(/^US-/, "") : null,
+    centroid: centroidOf(largest),
+    geometry: parts.length === 1 ? { type: "Polygon", coordinates: parts[0] } : { type: "MultiPolygon", coordinates: parts },
   };
 }
 
@@ -63,13 +71,19 @@ async function query(url: string, where: string): Promise<WfigsFeature[]> {
 }
 
 export async function listActiveFires(): Promise<FireRecord[]> {
-  const features = await query(CURRENT, "1=1");
+  const features = await query(
+    CURRENT,
+    "attr_IncidentTypeCategory='WF' AND (attr_PercentContained IS NULL OR attr_PercentContained < 100)",
+  );
   return features
     .map((feature, index) => toRecord(feature, `fire-${index}`))
-    .filter((fire): fire is FireRecord => fire !== null);
+    .filter((fire): fire is FireRecord => fire !== null)
+    .sort((a, b) => (b.acres ?? 0) - (a.acres ?? 0));
 }
 
 export async function getPalisadesFire(): Promise<FireRecord | null> {
+  const saved = demoPalisades();
+  if (saved) return saved;
   const features = await query(
     HISTORY,
     "attr_POOState='US-CA' AND poly_IncidentName='PALISADES' AND poly_GISAcres=23448",

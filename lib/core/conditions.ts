@@ -1,11 +1,9 @@
 /**
- * Fetches wind, humidity, red-flag status, elevation, and slope for one fire.
- * Connected to app/api/fires/detail/route.ts, Open-Meteo, and api.weather.gov.
- * Called only after a fire is clicked.
+ * Fetches wind, humidity, temperature, red-flag status, elevation, slope, and the next 6 forecast hours.
+ * Connected to app/api/fire-detail/route.ts, Open-Meteo, and api.weather.gov.
+ * Called only after a fire is clicked. The hourly list feeds lib/core/spread.ts.
  */
-import type { FireRecord } from "./fires";
-import type { LngLat } from "./geo";
-import { projectSpread } from "./spread";
+import type { WeatherHour } from "./spread";
 import type { Tag } from "./tags";
 
 export type Conditions = {
@@ -13,9 +11,13 @@ export type Conditions = {
   windMph: number;
   windFromDeg: number;
   humidity: number | null;
+  tempF: number | null;
+  soil: number | null;
   slopePct: number | null;
+  elevation: number | null;
+  redFlag: string;
   tags: Tag[];
-  hotspotCount: number | null;
+  hourly: WeatherHour[];
 };
 
 function hourIndex(times: string[], hoursAhead: number): number {
@@ -23,7 +25,7 @@ function hourIndex(times: string[], hoursAhead: number): number {
   let best = 0;
   let bestDiff = Infinity;
   times.forEach((time, index) => {
-    const diff = Math.abs(Date.parse(time) - target);
+    const diff = Math.abs(Date.parse(/Z|[+-]\d\d:?\d\d$/.test(time) ? time : `${time}Z`) - target);
     if (diff < bestDiff) {
       bestDiff = diff;
       best = index;
@@ -50,7 +52,7 @@ async function elevation(lat: number, lon: number): Promise<{ center: number | n
   return { center, slopePct: (rise / runMeters) * 100 };
 }
 
-function compass(degrees: number): string {
+export function compass(degrees: number): string {
   const names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
   return names[Math.round(degrees / 45) % 8] ?? "N";
 }
@@ -66,32 +68,15 @@ async function redFlag(lat: number, lon: number): Promise<string> {
   return fireWeather[0] ?? "None active";
 }
 
-async function hotspots(lat: number, lon: number): Promise<number | null> {
-  const key = process.env.FIRMS_MAP_KEY;
-  if (!key) return null;
-  const west = lon - 0.2;
-  const south = lat - 0.2;
-  const east = lon + 0.2;
-  const north = lat + 0.2;
-  const response = await fetch(
-    `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${key}/VIIRS_SNPP_NRT/${west},${south},${east},${north}/1`,
-  );
-  if (!response.ok) return null;
-  const text = await response.text();
-  const lines = text.trim().split("\n");
-  return Math.max(lines.length - 1, 0);
-}
-
 export async function getFireConditions(lat: number, lon: number, hoursAhead = 1): Promise<Conditions> {
   const forecastUrl =
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
     "&hourly=wind_speed_10m,wind_direction_10m,relative_humidity_2m,temperature_2m,soil_moisture_0_to_1cm" +
-    "&wind_speed_unit=mph&temperature_unit=fahrenheit&forecast_days=1";
-  const [forecastRes, terrain, flag, hotspotCount] = await Promise.all([
+    "&wind_speed_unit=mph&temperature_unit=fahrenheit&forecast_days=2&timezone=GMT";
+  const [forecastRes, terrain, flag] = await Promise.all([
     fetch(forecastUrl),
     elevation(lat, lon),
     redFlag(lat, lon).catch(() => "unavailable"),
-    hotspots(lat, lon).catch(() => null),
   ]);
 
   if (!forecastRes.ok) {
@@ -100,8 +85,12 @@ export async function getFireConditions(lat: number, lon: number, hoursAhead = 1
       windMph: 0,
       windFromDeg: 0,
       humidity: null,
+      tempF: null,
+      soil: null,
       slopePct: terrain.slopePct,
-      hotspotCount,
+      elevation: terrain.center,
+      redFlag: flag,
+      hourly: [],
       tags: [{ label: "Conditions", value: "unavailable", detail: "Open-Meteo did not respond." }],
     };
   }
@@ -128,7 +117,7 @@ export async function getFireConditions(lat: number, lon: number, hoursAhead = 1
     {
       label: "Wind",
       value: `${windMph.toFixed(0)} mph from ${compass(windFromDeg)}`,
-      detail: windMph >= 15 ? `High wind. Forecast hour closest to ${hoursAhead} h.` : `Forecast hour closest to ${hoursAhead} h.`,
+      detail: `${windMph >= 15 ? "High wind. " : ""}${hoursAhead === 0 ? "Current forecast hour." : `Forecast hour closest to ${hoursAhead} h from now.`}`,
     },
     {
       label: "Humidity",
@@ -145,7 +134,6 @@ export async function getFireConditions(lat: number, lon: number, hoursAhead = 1
       value: soil == null ? "unavailable" : soil.toFixed(3),
       detail: "0 to 1 cm, cubic meters per cubic meter.",
     },
-    { label: "Red flag", value: flag, detail: "Only a red flag or fire weather alert. Other advisories are not shown here." },
     {
       label: "Elevation",
       value: terrain.center == null ? "unavailable" : `${Math.round(terrain.center)} m`,
@@ -156,38 +144,34 @@ export async function getFireConditions(lat: number, lon: number, hoursAhead = 1
       value: terrain.slopePct == null ? "unavailable" : `${terrain.slopePct.toFixed(0)}%`,
       detail: terrain.slopePct != null && terrain.slopePct > 20 ? "Steep. Estimated from points about 2 km away." : "Estimated from points about 2 km away.",
     },
-    {
-      label: "Hotspots",
-      value: hotspotCount == null ? "unavailable" : String(hotspotCount),
-      detail: hotspotCount == null ? "FIRMS_MAP_KEY is missing or the count failed." : "VIIRS count in a small box around the fire, last day.",
-    },
   ];
 
-  return { forecastOk: Boolean(hourly), windMph, windFromDeg, humidity, slopePct: terrain.slopePct, tags, hotspotCount };
-}
+  const next: WeatherHour[] = [];
+  if (hourly) {
+    const start = hourIndex(hourly.time, 0);
+    for (let h = 1; h <= 6; h += 1) {
+      const j = Math.min(start + h, hourly.time.length - 1);
+      next.push({
+        windMph: hourly.wind_speed_10m[j] ?? 0,
+        windFromDeg: hourly.wind_direction_10m[j] ?? 0,
+        humidity: hourly.relative_humidity_2m[j] ?? null,
+        tempF: hourly.temperature_2m[j] ?? null,
+        soil: hourly.soil_moisture_0_to_1cm[j] ?? null,
+      });
+    }
+  }
 
-export async function getFireDetail(fire: FireRecord, hours: number): Promise<{
-  tags: Tag[];
-  assumptions: string[];
-  cone: LngLat[];
-}> {
-  const conditions = await getFireConditions(fire.centroid[1], fire.centroid[0], hours);
-  const spread = projectSpread(fire, conditions.windMph, conditions.windFromDeg, conditions.humidity, conditions.slopePct, hours);
   return {
-    tags: [
-      {
-        label: "Acres",
-        value: fire.acres == null ? "unavailable" : Math.round(fire.acres).toLocaleString(),
-        detail: "WFIGS perimeter acres.",
-      },
-      {
-        label: "Containment",
-        value: fire.containment == null ? "unavailable" : `${Math.round(fire.containment)}%`,
-        detail: "WFIGS percent contained.",
-      },
-      ...conditions.tags,
-    ],
-    assumptions: spread.assumptions,
-    cone: spread.cone,
+    forecastOk: Boolean(hourly),
+    windMph,
+    windFromDeg,
+    humidity,
+    tempF: temperature,
+    soil,
+    slopePct: terrain.slopePct,
+    elevation: terrain.center,
+    redFlag: flag,
+    tags,
+    hourly: next,
   };
 }

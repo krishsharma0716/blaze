@@ -1,0 +1,25 @@
+open-meteo forecast | 200 1460B 0.500959s | fixtures/raw/openmeteo_forecast.json
+open-meteo elevation | 200 28B 0.495994s | fixtures/raw/openmeteo_elevation.json
+nws alerts | 200 7699B 0.141341s | fixtures/raw/nws_alerts.json
+gibs tile | 200 12870B 0.288535s | fixtures/raw/gibs_tile.jpg
+firms viirs | 400 16B 0.154677s | fixtures/raw/firms.csv
+wfigs current | 200 1231B 0.284677s | fixtures/raw/wfigs_current.json
+wfigs history palisades | 200 2105B 0.190192s | fixtures/raw/wfigs_palisades.json
+usfs housing density info | 403 1332B 0.107820s | fixtures/raw/usfs_hud_info.json
+usfs housing density identify | 403 1332B 0.107918s | fixtures/raw/usfs_hud_identify.json
+usfs wildfire folder | 403 1332B 0.108519s | fixtures/raw/usfs_folder.json
+landfire services | 200 523B 0.151455s | fixtures/raw/landfire_services.json
+nlcd wms capabilities | 200 638598B 0.342880s | fixtures/raw/nlcd_caps.xml
+gbif ccw polygon | 200 443B 0.516684s | fixtures/raw/gbif_ccw.json
+gbif cw polygon | 200 83B 0.400101s | fixtures/raw/gbif_cw.json
+critical habitat | 200 6994B 0.169212s | fixtures/raw/crithab.json
+nyc geosearch | 200 1549B 0.156023s | fixtures/raw/geosearch.json
+nyc pluto by bbl | 200 1472B 1.401504s | fixtures/raw/pluto.json
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+More details here: https://curl.se/docs/sslcerts.html
+
+curl failed to verify the legitimacy of the server and therefore could not
+establish a secure connection to it. To learn more about this situation and
+how to fix it, please visit the web page mentioned above.
+nyc open data: solar datasets | 000 0B 0.101552s | fixtures/raw/nyc_solar_catalog.json
+overpass buildings | 200 414B 2.027353s | fixtures/raw/overpass.json

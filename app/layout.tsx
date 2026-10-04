@@ -4,10 +4,11 @@
  * It does not fetch data.
  */
 import type { ReactNode } from "react";
+import "maplibre-gl/dist/maplibre-gl.css";
 import "./globals.css";
 
 export const metadata = {
-  title: "Incident board",
+  title: "Wildfire map and NYC brief",
   description: "Live incident board for the wildfire and NYC call brief.",
 };
 

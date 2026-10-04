@@ -47,7 +47,7 @@ One Next.js app with one MapLibre map, one side panel of tags, one live incident
 ### Words on screen
 
 - "Projection", never "prediction". "Estimate". "Homes inside the projection". "This is not an evacuation order."
-- "Animals displaced." "Vegetation mapped here." Counts are records inside the perimeter.
+- "Animals recorded here" (was "Animals displaced"). "Species recorded in these areas" for the totals. "Vegetation mapped here." Counts are records inside the perimeter.
 - Solar tag is `Solar permit on file: Yes` or `No record`. `No record` means no DOB NOW Build filing with a solar work type for that lot. It does not mean the roof has no panels. If the tag is Yes, add "check for battery storage". Never assert a battery.
 - FIRMS and GIBS are the satellite layers. There is no house photo.
 - Always show "Ember spotting is not modeled."

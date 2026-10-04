@@ -1,27 +1,39 @@
 /**
- * Carbon estimate, animals recorded, habitat overlap, vegetation, and help links.
- * Connected to app/api/fire-detail/route.ts, GBIF, USFWS, and LANDFIRE.
- * Species lines are labeled animals displaced. Counts are records inside the perimeter.
+ * Carbon estimate, animals recorded here (with photos), habitat overlap, and vegetation for one fire.
+ * Connected to app/api/fire-detail, app/api/summary, GBIF, iNaturalist, USFWS, and LANDFIRE.
+ * Species counts are GBIF records inside the perimeter. Photos are iNaturalist taxon photos.
  */
-import { areaHa, ringOf, simplifyRing, type LngLat } from "./geo";
+import { convexHull, counterClockwise, ringOf, simplifyRing, type LngLat } from "./geo";
 import type { FireRecord } from "./fires";
 import type { Tag } from "./tags";
 
-export type HelpLink = { group: "Forests" | "People"; name: string; url: string; note: string };
+export type Species = {
+  key: string;
+  name: string;
+  scientific: string | null;
+  count: number;
+  photo: string | null;
+  credit: string | null;
+  link: string | null;
+};
 
 export type Recovery = {
   tags: Tag[];
-  species: { name: string; count: number }[];
+  species: Species[];
+  speciesTotal: number;
   habitat: string[];
   vegetation: string;
-  links: HelpLink[];
+  fuel: FuelKind;
+  co2Now: number | null;
 };
 
-const FUEL = {
+export type FuelKind = "forest" | "shrub" | "grass";
+
+export const FUEL: Record<FuelKind, { load: number; fraction: number }> = {
   forest: { load: 50, fraction: 0.4 },
   shrub: { load: 15, fraction: 0.7 },
   grass: { load: 3, fraction: 0.9 },
-} as const;
+};
 
 async function grab(url: string, ms = 4000): Promise<Response | null> {
   try {
@@ -32,45 +44,110 @@ async function grab(url: string, ms = 4000): Promise<Response | null> {
   }
 }
 
-function fuelClass(name: string | null): keyof typeof FUEL {
-  if (!name) return "shrub";
+export function fuelClass(vegetation: Vegetation | null): FuelKind {
+  if (!vegetation) return "shrub";
+  if (/^tree/i.test(vegetation.lifeform)) return "forest";
+  if (/^shrub/i.test(vegetation.lifeform)) return "shrub";
+  if (/^herb/i.test(vegetation.lifeform)) return "grass";
+  const name = vegetation.name;
   if (/grass|herb|meadow/i.test(name)) return "grass";
   if (/shrub|chaparral|scrub/i.test(name)) return "shrub";
   if (/forest|wood|pine|fir|oak|timber|conifer/i.test(name)) return "forest";
   return "shrub";
 }
 
-function co2Tonnes(hectares: number, kind: keyof typeof FUEL): number {
+export function co2Tonnes(hectares: number, kind: FuelKind): number {
   const fuel = FUEL[kind];
   return hectares * fuel.load * fuel.fraction * 1.6;
 }
 
 function wkt(ring: LngLat[]): string {
-  const slim = simplifyRing(ring, 12);
+  const slim = counterClockwise(simplifyRing(ring, 12));
   const closed = slim[0][0] === slim[slim.length - 1][0] && slim[0][1] === slim[slim.length - 1][1] ? slim : [...slim, slim[0]];
   return `POLYGON((${closed.map(([lon, lat]) => `${lon} ${lat}`).join(",")}))`;
 }
 
-async function speciesIn(ring: LngLat[]): Promise<{ name: string; count: number }[]> {
+function facetUrl(ring: LngLat[], limit: number): string {
   const url = new URL("https://api.gbif.org/v1/occurrence/search");
   url.searchParams.set("geometry", wkt(ring));
   url.searchParams.set("kingdomKey", "1");
   url.searchParams.set("facet", "speciesKey");
-  url.searchParams.set("facetLimit", "6");
+  url.searchParams.set("facetLimit", String(limit));
   url.searchParams.set("limit", "0");
-  const response = await grab(url.toString());
-  if (!response) return [];
-  const body = (await response.json()) as { facets?: { counts?: { name: string; count: number }[] }[] };
-  const counts = body.facets?.[0]?.counts?.slice(0, 5) ?? [];
-  const named = await Promise.all(
-    counts.map(async (item) => {
-      const lookup = await grab(`https://api.gbif.org/v1/species/${item.name}`, 2500);
-      if (!lookup) return { name: "name unavailable", count: item.count };
-      const species = (await lookup.json()) as { vernacularName?: string; canonicalName?: string };
-      return { name: species.vernacularName || species.canonicalName || "name unavailable", count: item.count };
-    }),
-  );
-  return named;
+  return url.toString();
+}
+
+export async function speciesCounts(ring: LngLat[], limit = 3000): Promise<{ key: string; count: number }[] | null> {
+  if (ring.length < 3) return [];
+  let shape = ring;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(facetUrl(shape, limit), { signal: AbortSignal.timeout(8000), cache: "no-store" });
+    } catch {
+      return null;
+    }
+    if (response.status === 429) {
+      await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
+      continue;
+    }
+    if (response.status === 400 && shape === ring) {
+      shape = convexHull(ring);
+      continue;
+    }
+    if (!response.ok) return null;
+    const body = (await response.json()) as { facets?: { counts?: { name: string; count: number }[] }[] };
+    return (body.facets?.[0]?.counts ?? []).map((item) => ({ key: item.name, count: item.count }));
+  }
+  return null;
+}
+
+async function describe(key: string, count: number): Promise<Species> {
+  const lookup = await grab(`https://api.gbif.org/v1/species/${key}`, 2500);
+  const gbif = lookup ? ((await lookup.json()) as { vernacularName?: string; canonicalName?: string }) : {};
+  const scientific = gbif.canonicalName ?? null;
+  let common: string | null = gbif.vernacularName ?? null;
+  let photo: string | null = null;
+  let credit: string | null = null;
+  let link: string | null = null;
+  if (scientific) {
+    const inat = await grab(
+      `https://api.inaturalist.org/v1/taxa?q=${encodeURIComponent(scientific)}&rank=species&per_page=1`,
+      3000,
+    );
+    const taxon = inat
+      ? ((await inat.json()) as {
+          results?: {
+            id?: number;
+            name?: string;
+            preferred_common_name?: string;
+            default_photo?: { medium_url?: string; attribution?: string };
+          }[];
+        }).results?.[0]
+      : undefined;
+    if (taxon && taxon.name?.toLowerCase() === scientific.toLowerCase()) {
+      common = taxon.preferred_common_name ?? common;
+      photo = taxon.default_photo?.medium_url ?? null;
+      credit = taxon.default_photo?.attribution ?? null;
+      link = taxon.id ? `https://www.inaturalist.org/taxa/${taxon.id}` : null;
+    }
+  }
+  return {
+    key,
+    name: common ? common.replace(/(^|[\s-])\w/g, (letter) => letter.toUpperCase()) : scientific ?? "name unavailable",
+    scientific,
+    count,
+    photo,
+    credit,
+    link,
+  };
+}
+
+async function speciesIn(ring: LngLat[]): Promise<{ species: Species[]; total: number }> {
+  const counts = await speciesCounts(ring);
+  if (!counts) return { species: [], total: 0 };
+  const species = await Promise.all(counts.slice(0, 8).map((item) => describe(item.key, item.count)));
+  return { species, total: counts.length };
 }
 
 async function habitatIn(ring: LngLat[]): Promise<string[]> {
@@ -104,67 +181,91 @@ async function habitatIn(ring: LngLat[]): Promise<string[]> {
   return [...names].slice(0, 6);
 }
 
-async function vegetationAt(lon: number, lat: number): Promise<string | null> {
-  const url =
-    "https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2024/LF2024_EVT_CONUS/ImageServer/identify" +
-    `?geometry=${lon},${lat}&geometryType=esriGeometryPoint&f=json`;
-  const response = await grab(url, 2500);
+export type Vegetation = { name: string; lifeform: string };
+
+type EvtRow = { Value?: number; EVT_NAME?: string; EVT_LF?: string };
+
+const LANDFIRE = "https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2024/LF2024_EVT_CONUS/ImageServer";
+
+export async function evtCode([lon, lat]: LngLat): Promise<number | null> {
+  const point = JSON.stringify({ x: lon, y: lat, spatialReference: { wkid: 4326 } });
+  const response = await grab(
+    `${LANDFIRE}/identify?geometry=${encodeURIComponent(point)}&geometryType=esriGeometryPoint&returnCatalogItems=false&f=json`,
+    4000,
+  );
   if (!response) return null;
-  const body = (await response.json()) as { value?: string; properties?: { EVT_Name?: string } };
-  const name = body.properties?.EVT_Name ?? (body.value ? String(body.value) : null);
-  if (!name || /nodata|no data/i.test(name)) return null;
-  return name;
+  const code = Number(((await response.json()) as { value?: string }).value);
+  return Number.isFinite(code) && code >= 0 ? code : null;
 }
 
-function helpLinks(lon: number, lat: number): HelpLink[] {
-  const california = lon < -114 && lon > -125 && lat > 32 && lat < 42.2;
-  const tahoe = lon < -119.7 && lon > -120.4 && lat > 38.6 && lat < 39.5;
-  const southernCalifornia = california && lat < 35.8;
-  const links: HelpLink[] = [
-    { group: "Forests", name: "National Forest Foundation", url: "https://www.nationalforests.org/tree-planting-programs", note: "Reforestation on national forests. You cannot pick the fire." },
-    { group: "Forests", name: "Forest Service Plant-a-Tree", url: "https://www.fs.usda.gov/working-with-us/donations", note: "The agency's seedling donations." },
-    { group: "Forests", name: "American Forests", url: "https://www.americanforests.org/", note: "Large-scale restoration, including after fire." },
-    { group: "People", name: "After the Fire USA", url: "https://afterthefireusa.org/", note: "Long-term community recovery, not tree planting." },
-    { group: "People", name: "Red Cross wildfire relief", url: "https://www.redcross.org/about-us/our-work/disaster-relief/wildfire-relief.html", note: "Shelter and financial help right after the fire." },
-  ];
-  if (california) {
-    links.splice(3, 0, { group: "Forests", name: "Penny Pines", url: "https://www.nationalforests.org/get-involved/penny-pines", note: "California only. About $68 toward an acre on a named national forest." });
+export async function evtTable(): Promise<Map<number, Vegetation> | null> {
+  const rule = JSON.stringify({ rasterFunction: "LF2024_EVT_CONUS" });
+  const response = await grab(`${LANDFIRE}/rasterAttributeTable?renderingRule=${encodeURIComponent(rule)}&f=json`, 8000);
+  if (!response) return null;
+  const body = (await response.json()) as { features?: { attributes?: EvtRow }[] };
+  const table = new Map<number, Vegetation>();
+  for (const feature of body.features ?? []) {
+    const row = feature.attributes;
+    if (row?.Value == null || !row.EVT_NAME || /nodata/i.test(row.EVT_NAME)) continue;
+    table.set(row.Value, { name: row.EVT_NAME, lifeform: row.EVT_LF ?? "" });
   }
-  if (tahoe) links.splice(3, 0, { group: "Forests", name: "Sugar Pine Foundation", url: "https://sugarpinefoundation.org/", note: "Tahoe burn scars." });
-  if (southernCalifornia) links.splice(3, 0, { group: "Forests", name: "TreePeople", url: "https://www.treepeople.org/", note: "Southern California." });
-  return links;
+  return table;
 }
 
-export async function getRecovery(fire: FireRecord, cone: LngLat[] | null): Promise<Recovery> {
+export async function vegetationAt(fire: FireRecord): Promise<Vegetation | null> {
+  const ring = ringOf(fire.geometry);
+  const [cx, cy] = fire.centroid;
+  const samples: LngLat[] = [fire.centroid];
+  for (const share of [0, 0.25, 0.5, 0.75]) {
+    const edge = ring[Math.floor(share * ring.length)];
+    if (edge) samples.push([(cx + edge[0]) / 2, (cy + edge[1]) / 2]);
+  }
+  const [codes, table] = await Promise.all([
+    Promise.all(samples.map((point) => evtCode(point).catch(() => null))),
+    evtTable(),
+  ]);
+  if (!table) return null;
+  const rows = codes.map((code) => (code == null ? undefined : table.get(code))).filter((row): row is Vegetation => Boolean(row));
+  const natural = rows.filter((row) => /^(tree|shrub|herb)/i.test(row.lifeform));
+  const pool = natural.length > 0 ? natural : rows;
+  if (pool.length === 0) return null;
+  const tally = new Map<string, { row: Vegetation; count: number }>();
+  for (const row of pool) tally.set(row.name, { row, count: (tally.get(row.name)?.count ?? 0) + 1 });
+  return [...tally.values()].sort((a, b) => b.count - a.count)[0].row;
+}
+
+export function fuelNote(vegetation: Vegetation | null): string {
+  if (vegetation == null) {
+    return "Vegetation only, structures excluded. Vegetation sample failed, so shrub defaults were used: 15 t/ha, 0.7 burned, 1.6 t CO2 per tonne. Estimate.";
+  }
+  const kind = fuelClass(vegetation);
+  const fuel = FUEL[kind];
+  return `Vegetation only, structures excluded. ${kind} defaults: ${fuel.load} t/ha, fraction ${fuel.fraction}, 1.6 t CO2 per tonne of dry fuel. Estimate.`;
+}
+
+export async function getRecovery(fire: FireRecord): Promise<Recovery> {
   const ring = ringOf(fire.geometry);
   const [animals, habitat, vegetation] = await Promise.all([
-    speciesIn(ring).catch(() => []),
+    speciesIn(ring).catch(() => ({ species: [], total: 0 })),
     habitatIn(ring).catch(() => []),
-    vegetationAt(fire.centroid[0], fire.centroid[1]).catch(() => null),
+    vegetationAt(fire).catch(() => null),
   ]);
-  const kind = fuelClass(vegetation);
-  const assumed = vegetation == null;
   const burnedHa = fire.acres == null ? null : fire.acres * 0.404686;
-  const now = burnedHa == null ? null : co2Tonnes(burnedHa, kind);
-  const projectedHa = cone && cone.length >= 3 ? areaHa(cone) : null;
-  const projected = projectedHa == null ? null : co2Tonnes(projectedHa, kind);
-  const fuel = FUEL[kind];
-  const fuelNote = assumed
-    ? "Vegetation sample failed, so shrub defaults were used: 15 t/ha, 0.7 burned, 1.6 t CO2 per tonne. Estimate."
-    : `${kind} defaults: ${fuel.load} t/ha, fraction ${fuel.fraction}, 1.6 t CO2 per tonne of dry fuel. Estimate. Vegetation mapped here.`;
+  const now = burnedHa == null ? null : co2Tonnes(burnedHa, fuelClass(vegetation));
   return {
-    species: animals,
+    species: animals.species,
+    speciesTotal: animals.total,
     habitat,
-    vegetation: vegetation ?? "unavailable",
-    links: helpLinks(fire.centroid[0], fire.centroid[1]),
+    vegetation: vegetation?.name ?? "unavailable",
+    fuel: fuelClass(vegetation),
+    co2Now: now,
     tags: [
-      { label: "CO2 now", value: now == null ? "unavailable" : `${Math.round(now).toLocaleString()} t`, detail: fuelNote },
+      { label: "CO2 now", value: now == null ? "unavailable" : `${Math.round(now).toLocaleString()} t`, detail: fuelNote(vegetation) },
       {
-        label: "CO2 projected",
-        value: projected == null ? "unavailable" : `${Math.round(projected).toLocaleString()} t`,
-        detail: cone ? `Same formula on the cone area, about ${projectedHa?.toFixed(0)} ha. Estimate.` : "No cone, so projected CO2 was not calculated.",
+        label: "Vegetation mapped here",
+        value: vegetation?.name ?? "unavailable",
+        detail: `LANDFIRE 2024 existing vegetation, most common natural type at five points inside the perimeter${vegetation?.lifeform ? `, life form ${vegetation.lifeform.toLowerCase()}` : ""}. Not a stem map.`,
       },
-      { label: "Vegetation mapped here", value: vegetation ?? "unavailable", detail: "LANDFIRE 2024 existing vegetation at the centroid. Not a stem map." },
     ],
   };
 }
